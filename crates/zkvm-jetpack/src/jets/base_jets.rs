@@ -8,6 +8,13 @@ use crate::form::math::base::*;
 use crate::form::poly::*;
 use crate::jets::utils::*;
 
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+
+static ROOT_CACHE: Lazy<Mutex<HashMap<u64, Belt>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 // base field jets
 //
 // When possible, all these functions do is get the sample from the subject,
@@ -73,17 +80,25 @@ pub fn bmul_jet(context: &mut Context, subject: Noun) -> Result {
     Ok(Atom::new(&mut context.stack, (a_belt * b_belt).into()).as_noun())
 }
 
-pub fn ordered_root_jet(context: &mut Context, subject: Noun) -> Result {
-    let n = slot(subject, 6)?;
+// pub fn ordered_root_jet(context: &mut Context, subject: Noun) -> Result {
+//     let n = slot(subject, 6)?;
 
-    let Ok(n_atom) = n.as_atom() else {
-        debug!("n was not an atom");
-        return jet_err();
-    };
-    let n_u64 = Belt(n_atom.as_u64()?);
-    // TODO: clean this up
-    let res_atom = Atom::new(&mut context.stack, n_u64.ordered_root()?.into());
-    Ok(res_atom.as_noun())
+//     let Ok(n_atom) = n.as_atom() else {
+//         debug!("n was not an atom");
+//         return jet_err();
+//     };
+//     let n_u64 = Belt(n_atom.as_u64()?);
+//     // TODO: clean this up
+//     let res_atom = Atom::new(&mut context.stack, n_u64.ordered_root()?.into());
+//     Ok(res_atom.as_noun())
+// }
+
+pub fn ordered_root_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr> {
+    let n = slot(subject, 6)?.as_atom()?;
+    let n_64 = n.as_u64()?;
+    let mut cache = ROOT_CACHE.lock().unwrap();
+    let root = cache.entry(n_64).or_insert_with(|| Belt(n_64).ordered_root()?).clone();
+    Ok(Atom::new(&mut context.stack, root.0).as_noun())
 }
 
 pub fn bpow_jet(context: &mut Context, subject: Noun) -> Result {

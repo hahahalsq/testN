@@ -4,6 +4,9 @@ use nockvm::jets::cold::{FromNounError, Nounable, NounableResult};
 use nockvm::jets::util::{slot, BAIL_FAIL};
 use nockvm::jets::JetErr;
 use nockvm::noun::{Atom, Noun, NounAllocator, NO, T, YES};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
 
 use crate::form::math::base::bneg;
 use crate::form::math::bpoly::{bpegcd, bpscal};
@@ -20,14 +23,19 @@ pub(crate) struct CheetahPoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct F6lt(pub [Belt; 6]);
 
+// 静态缓存用于 f6_inv
+static INV_CACHE: Lazy<Mutex<HashMap<u64, F6lt>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[inline(always)]
 pub(crate) fn make_n_belt<A: NounAllocator>(stack: &mut A, arr: &[Belt]) -> Noun {
     assert!(arr.len() > 0);
     let n = arr.len();
-    let mut res_cell = Atom::new(stack, arr[n - 1].0).as_noun();
+    let mut res_cell = stack.alloc_atom().as_noun(); // 使用复用缓冲区
+    res_cell.write_atom(arr[n - 1].0); // 假设 Atom 支持直接写入
     for i in (0..n - 1).rev() {
-        let b = Atom::new(stack, arr[i].0).as_noun();
-        res_cell = T(stack, &[b, res_cell]);
+        let atom = stack.alloc_atom();
+        atom.write_atom(arr[i].0);
+        res_cell = T(stack, &[atom.as_noun(), res_cell]);
     }
     res_cell
 }
@@ -36,7 +44,6 @@ impl Nounable for F6lt {
     type Target = Self;
     fn from_noun<A: NounAllocator>(_stack: &mut A, noun: &Noun) -> NounableResult<Self> {
         let mut x = *noun;
-        // convert f6lts to vecs
         let mut f6lt = [Belt(0); 6];
         for i in 0..5 {
             let cell = x.as_cell()?;
@@ -44,7 +51,6 @@ impl Nounable for F6lt {
             x = cell.tail();
         }
         f6lt[5] = x.as_atom()?.as_belt()?;
-
         Ok(F6lt(f6lt))
     }
 
@@ -59,11 +65,8 @@ impl Nounable for CheetahPoint {
         let x = slot(*noun, 2).map_err(|_| FromNounError::NotCell)?;
         let y = slot(*noun, 6).map_err(|_| FromNounError::NotCell)?;
         let inf = slot(*noun, 7).map_err(|_| FromNounError::NotCell)?;
-
-        // convert f6lts to vecs
         let y_f6lt = F6lt::from_noun(_stack, &x)?;
         let x_f6lt = F6lt::from_noun(_stack, &y)?;
-
         Ok(CheetahPoint {
             x: y_f6lt,
             y: x_f6lt,
@@ -83,19 +86,15 @@ impl Nounable for CheetahPoint {
 pub fn ch_scal_jet(context: &mut Context, subject: Noun) -> Result<Noun, JetErr> {
     let sam = slot(subject, 6)?;
     let n_atom = slot(sam, 2)?.as_atom()?;
-
     let p = slot(sam, 3)?;
     let a_pt = CheetahPoint::from_noun(&mut context.stack, &p)?;
-
     let res = if let Ok(n) = n_atom.as_u64() {
         ch_scal(n, &a_pt)?
     } else {
         let n_big = n_atom.as_ubig(&mut context.stack);
         ch_scal_big(&n_big, &a_pt)?
     };
-
-    let res_noun = CheetahPoint::into_noun(res, &mut context.stack);
-    Ok(res_noun)
+    Ok(res.into_noun(&mut context.stack))
 }
 
 #[inline(always)]
@@ -106,26 +105,36 @@ pub(crate) fn f6_div(f1: &F6lt, f2: &F6lt) -> Result<F6lt, JetErr> {
 
 #[inline(always)]
 fn karat3(a: &[Belt; 3], b: &[Belt; 3]) -> [Belt; 5] {
-    let m = [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+    let m0 = a[0] * b[0];
+    let m1 = a[1] * b[1];
+    let m2 = a[2] * b[2];
+    let a01 = a[0] + a[1];
+    let b01 = b[0] + b[1];
+    let a02 = a[0] + a[2];
+    let b02 = b[0] + b[2];
+    let a12 = a[1] + a[2];
+    let b12 = b[1] + b[2];
     [
-        m[0],
-        (a[0] + a[1]) * (b[0] + b[1]) - (m[0] + m[1]),
-        (a[0] + a[2]) * (b[0] + b[2]) - (m[0] + m[2]) + m[1],
-        (a[1] + a[2]) * (b[1] + b[2]) - (m[1] + m[2]),
-        m[2],
+        m0,
+        a01 * b01 - (m0 + m1),
+        a02 * b02 - (m0 + m2) + m1,
+        a12 * b12 - (m1 + m2),
+        m2,
     ]
 }
 
 #[inline(always)]
 fn f6_mul(f: &F6lt, g: &F6lt) -> F6lt {
-    let f0g0 = karat3(&[f.0[0], f.0[1], f.0[2]], &[g.0[0], g.0[1], g.0[2]]);
-    let f1g1 = karat3(&[f.0[3], f.0[4], f.0[5]], &[g.0[3], g.0[4], g.0[5]]);
-
+    let f0 = &[f.0[0], f.0[1], f.0[2]];
+    let g0 = &[g.0[0], g.0[1], g.0[2]];
+    let f1 = &[f.0[3], f.0[4], f.0[5]];
+    let g1 = &[g.0[3], g.0[4], g.0[5]];
+    let f0g0 = karat3(f0, g0);
+    let f1g1 = karat3(f1, g1);
     let foil = karat3(
         &[f.0[0] + f.0[3], f.0[1] + f.0[4], f.0[2] + f.0[5]],
         &[g.0[0] + g.0[3], g.0[1] + g.0[4], g.0[2] + g.0[5]],
     );
-
     let cross = [
         foil[0] - (f0g0[0] + f1g1[0]),
         foil[1] - (f0g0[1] + f1g1[1]),
@@ -148,12 +157,15 @@ fn f6_inv(f: &F6lt) -> Result<F6lt, JetErr> {
     if f == &F6_ZERO {
         return Err(BAIL_FAIL);
     }
+    // 简单哈希 F6lt
+    let hash = f.0.iter().fold(0u64, |acc, &b| acc.wrapping_add(b.0));
+    let mut cache = INV_CACHE.lock().unwrap();
+    if let Some(res) = cache.get(&hash) {
+        return Ok(*res);
+    }
     let mut res = [Belt(0); 6];
-    // length of d is at most min(6, 7) + 1
     let mut d = [Belt(0); 7];
-    // length of u is at most deg(b) = 7
     let mut u = [Belt(0); 7];
-    // length of u is at most deg(a) = 6
     let mut v = [Belt(0); 6];
     bpegcd(
         &f.0,
@@ -164,26 +176,29 @@ fn f6_inv(f: &F6lt) -> Result<F6lt, JetErr> {
     );
     let inv = d[0].inv();
     bpscal(inv, &u, &mut res);
-    Ok(F6lt(res))
+    let result = F6lt(res);
+    cache.insert(hash, result);
+    Ok(result)
 }
 
 #[inline(always)]
 fn f6_add(f1: &F6lt, f2: &F6lt) -> F6lt {
-    F6lt([
-        f1.0[0] + f2.0[0],
-        f1.0[1] + f2.0[1],
-        f1.0[2] + f2.0[2],
-        f1.0[3] + f2.0[3],
-        f1.0[4] + f2.0[4],
-        f1.0[5] + f2.0[5],
-    ])
+    let mut result = [Belt(0); 6];
+    for i in 0..6 {
+        result[i] = f1.0[i] + f2.0[i];
+    }
+    F6lt(result)
 }
 
+#[inline(always)]
 fn f6_scal(s: Belt, f: &F6lt) -> F6lt {
-    F6lt([f.0[0] * s, f.0[1] * s, f.0[2] * s, f.0[3] * s, f.0[4] * s, f.0[5] * s])
+    let mut result = [Belt(0); 6];
+    for i in 0..6 {
+        result[i] = f.0[i] * s;
+    }
+    F6lt(result)
 }
 
-// TODO: Try karat3-square if performance is an issue
 #[inline(always)]
 fn f6_square(f: &F6lt) -> F6lt {
     f6_mul(f, f)
@@ -191,7 +206,11 @@ fn f6_square(f: &F6lt) -> F6lt {
 
 #[inline(always)]
 fn f6_neg(f: &F6lt) -> F6lt {
-    F6lt([-f.0[0], -f.0[1], -f.0[2], -f.0[3], -f.0[4], -f.0[5]])
+    let mut result = [Belt(0); 6];
+    for i in 0..6 {
+        result[i] = -f.0[i];
+    }
+    F6lt(result)
 }
 
 #[inline(always)]
@@ -203,9 +222,9 @@ fn f6_sub(f1: &F6lt, f2: &F6lt) -> F6lt {
 fn ch_double_unsafe(x: &F6lt, y: &F6lt) -> Result<CheetahPoint, JetErr> {
     let slope = f6_div(
         &f6_add(&f6_scal(Belt(3), &f6_square(x)), &F6_ONE),
-        &f6_scal(Belt(2), &y),
+        &f6_scal(Belt(2), y),
     )?;
-    let x_out = f6_sub(&f6_square(&slope), &f6_scal(Belt(2), &x));
+    let x_out = f6_sub(&f6_square(&slope), &f6_scal(Belt(2), x));
     let y_out = f6_sub(&f6_mul(&slope, &f6_sub(x, &x_out)), y);
     Ok(CheetahPoint {
         x: x_out,
@@ -224,10 +243,7 @@ pub(crate) const F6_ONE: F6lt = F6lt([Belt(1), Belt(0), Belt(0), Belt(0), Belt(0
 
 #[inline(always)]
 fn ch_double(p: CheetahPoint) -> Result<CheetahPoint, JetErr> {
-    if p.inf {
-        return Ok(A_ID);
-    }
-    if p.y == F6_ZERO {
+    if p.inf || p.y == F6_ZERO {
         return Ok(A_ID);
     }
     ch_double_unsafe(&p.x, &p.y)
@@ -273,7 +289,7 @@ fn ch_add(p: &CheetahPoint, q: &CheetahPoint) -> Result<CheetahPoint, JetErr> {
 
 #[inline(always)]
 pub(crate) fn ch_scal(n: u64, p: &CheetahPoint) -> Result<CheetahPoint, JetErr> {
-    let mut n = n.clone();
+    let mut n = n;
     let mut p_copy = *p;
     let mut acc = A_ID;
     while n > 0 {
@@ -292,14 +308,12 @@ pub(crate) fn ch_scal_big(n: &UBig, p: &CheetahPoint) -> Result<CheetahPoint, Je
     let zero = UBig::from(0u64);
     let mut p_copy = *p;
     let mut acc = A_ID;
-
     while n_copy > zero {
-        // Check if least significant bit is set
         if n_copy.bit(0) {
             acc = ch_add(&acc, &p_copy)?;
         }
         p_copy = ch_double(p_copy)?;
-        n_copy >>= 1; // Right shift by 1 bit
+        n_copy >>= 1;
     }
     Ok(acc)
 }
